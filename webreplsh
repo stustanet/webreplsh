@@ -1,0 +1,112 @@
+#! /usr/bin/env python3.6
+# We are stuck with python 3.6 until aiohttp supports 3.7
+
+# TODO ideas:
+# lines starting with "@" are commands to the wrsh:
+# @send filename.py  --> transmits the file to the remote (altnames: push, )
+# @pull filename.py --> pulls the file from the remote (altnames: receive )
+
+import sys
+import argparse
+import asyncio
+import logging
+
+# TODO check for an alternative
+import aiohttp
+
+def system_print(*args, **kwargs):
+    """
+    Make system text more obvious by making it blue
+    """
+    orig_end = kwargs.get('end', "\n")
+    kwargs['end'] = ""
+    print("\033[044m", end="")
+    print(*args, **kwargs)
+    print("\033[0m", end=orig_end) # newline
+
+
+async def websocket_interactive(remote, password, loop):
+    """
+    Start an interactive websocket shell
+    """
+    async def input_task(ws, loop):
+        queue = asyncio.Queue()
+
+        def response():
+            queue.put_nowait(sys.stdin.readline())
+
+        loop.add_reader(sys.stdin.fileno(), response)
+        while True:
+            data = await queue.get()
+            await ws.send_str(data + "\r\n")
+
+
+    # Webrepl sucks - and disrespects HTTP standard: we have to store the webkey in the
+    # correct header...
+    async def webrepl_header_fixer(session, context, params):
+        key = params.headers['Sec-Websocket-Key']
+        del params.headers['Sec-Websocket-Key']
+        # Retarded micropython implementation...
+        params.headers['Sec-WebSocket-Key'] = key
+
+    trace_config = aiohttp.TraceConfig()
+    trace_config.on_request_start.append(webrepl_header_fixer)
+
+    async with aiohttp.ClientSession(loop=loop, trace_configs=[trace_config]) as session:
+        if not (str.startswith(remote, "http") or str.startswith(remote, "ws:")):
+            remote = 'http://' + remote
+        system_print("# Connecting to %s"%remote)
+        async with session.ws_connect(remote) as ws:
+            system_print("Connected")
+
+            sender = loop.create_task(input_task(ws, loop))
+
+            line = ""
+            async for msg in ws:
+                #system_print("Received ", msg)
+                if msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+                elif msg.type == aiohttp.WSMsgType.TEXT:
+                    #system_print("Received ", msg)
+                    if msg.data=="Password: " and not password is None:
+                        await ws.send_str(password + "\r\n")
+                        password = None
+                    else:
+                        print(msg.data, end="")
+
+    sender.cancel()
+    try:
+        await sender
+    except asyncio.CancelledError:
+        pass
+
+    
+
+def main():
+    parser = argparse.ArgumentParser(description="Webrepl interface")
+    parser.add_argument('remote', help="Remote device; Example: 192.168.0.100:8266")
+    parser.add_argument('--password', '-p',
+                        help="The webrepl password")
+    args = parser.parse_args()
+
+    logger = logging.getLogger('websockets')
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler())
+
+    # TODO Determine if it is a local serial connection?
+
+    loop = asyncio.get_event_loop()
+
+    main = loop.create_task(websocket_interactive(args.remote, args.password, loop))
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+    main.cancel()
+    try:
+        loop.run_until_complete(main)
+    except asyncio.CancelledError:
+        pass
+
+main()
